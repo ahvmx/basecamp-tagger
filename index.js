@@ -89,12 +89,14 @@ app.post('/api/teams', (req, res) => {
     const insertMember = db.prepare('INSERT INTO members (id, team_id, user_id, name) VALUES (?, ?, ?, ?)');
     insertMember.run(memberId, teamId, userId, userName || 'Owner');
 
-    // Create default tags
+    // Create default tags with emojis
     const defaultTags = [
-      { name: 'Priority', color: '#ef4444' },
-      { name: 'In Progress', color: '#f59e0b' },
-      { name: 'Review', color: '#3b82f6' },
-      { name: 'Done', color: '#22c55e' }
+      { name: 'Urgent', color: '🔥' },
+      { name: 'In Progress', color: '🟡' },
+      { name: 'Review', color: '🔵' },
+      { name: 'Done', color: '✅' },
+      { name: 'Blocked', color: '🔒' },
+      { name: 'Bug', color: '🐛' }
     ];
 
     const insertTag = db.prepare('INSERT INTO tags (id, team_id, name, color) VALUES (?, ?, ?, ?)');
