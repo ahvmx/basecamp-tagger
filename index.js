@@ -16,6 +16,41 @@ const PORT = process.env.PORT || 3847;
 app.use(cors());
 app.use(express.json());
 
+// Simple rate limiting (per IP, 100 requests per minute)
+const rateLimitMap = new Map();
+const RATE_LIMIT = 100;
+const RATE_WINDOW = 60000; // 1 minute
+
+app.use((req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+
+  if (!rateLimitMap.has(ip)) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_WINDOW });
+    return next();
+  }
+
+  const record = rateLimitMap.get(ip);
+  if (now > record.resetTime) {
+    record.count = 1;
+    record.resetTime = now + RATE_WINDOW;
+    return next();
+  }
+
+  record.count++;
+  if (record.count > RATE_LIMIT) {
+    return res.status(429).json({ error: 'Too many requests, please try again later' });
+  }
+
+  next();
+});
+
+// Input sanitization helper
+function sanitizeString(str, maxLength = 255) {
+  if (typeof str !== 'string') return '';
+  return str.trim().substring(0, maxLength);
+}
+
 // Initialize SQLite database (use /data for persistent storage on Railway/Render)
 const dataDir = process.env.DATA_DIR || __dirname;
 if (!existsSync(dataDir)) {
@@ -74,7 +109,10 @@ function generateInviteCode() {
 // Create a new team
 app.post('/api/teams', (req, res) => {
   try {
-    const { name, userId, userName } = req.body;
+    const name = sanitizeString(req.body.name, 100);
+    const userId = sanitizeString(req.body.userId, 100);
+    const userName = sanitizeString(req.body.userName, 100);
+
     if (!name || !userId) {
       return res.status(400).json({ error: 'Team name and userId required' });
     }
@@ -117,7 +155,10 @@ app.post('/api/teams', (req, res) => {
 // Join a team with invite code
 app.post('/api/teams/join', (req, res) => {
   try {
-    const { inviteCode, userId, userName } = req.body;
+    const inviteCode = sanitizeString(req.body.inviteCode, 10);
+    const userId = sanitizeString(req.body.userId, 100);
+    const userName = sanitizeString(req.body.userName, 100);
+
     if (!inviteCode || !userId) {
       return res.status(400).json({ error: 'Invite code and userId required' });
     }
@@ -179,6 +220,43 @@ app.get('/api/teams/:teamId/details', (req, res) => {
   }
 });
 
+// Leave a team
+app.post('/api/teams/:teamId/leave', (req, res) => {
+  try {
+    const teamId = sanitizeString(req.params.teamId, 50);
+    const userId = sanitizeString(req.body.userId, 100);
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId required' });
+    }
+
+    // Check if user is a member
+    const member = db.prepare('SELECT * FROM members WHERE team_id = ? AND user_id = ?').get(teamId, userId);
+    if (!member) {
+      return res.status(404).json({ error: 'Not a member of this team' });
+    }
+
+    // Check if this is the last member
+    const memberCount = db.prepare('SELECT COUNT(*) as count FROM members WHERE team_id = ?').get(teamId);
+
+    if (memberCount.count === 1) {
+      // Last member leaving - delete the entire team
+      db.prepare('DELETE FROM card_tags WHERE team_id = ?').run(teamId);
+      db.prepare('DELETE FROM tags WHERE team_id = ?').run(teamId);
+      db.prepare('DELETE FROM members WHERE team_id = ?').run(teamId);
+      db.prepare('DELETE FROM teams WHERE id = ?').run(teamId);
+      return res.json({ success: true, teamDeleted: true, message: 'Team deleted (you were the last member)' });
+    }
+
+    // Remove the member
+    db.prepare('DELETE FROM members WHERE team_id = ? AND user_id = ?').run(teamId, userId);
+    res.json({ success: true, message: 'Left team successfully' });
+  } catch (error) {
+    console.error('Error leaving team:', error);
+    res.status(500).json({ error: 'Failed to leave team' });
+  }
+});
+
 // ============== TAG ENDPOINTS ==============
 
 // Get all tags for a team
@@ -196,9 +274,18 @@ app.get('/api/tags/:teamId', (req, res) => {
 // Create a tag
 app.post('/api/tags', (req, res) => {
   try {
-    const { teamId, name, color } = req.body;
+    const teamId = sanitizeString(req.body.teamId, 50);
+    const name = sanitizeString(req.body.name, 50);
+    const color = sanitizeString(req.body.color, 10);
+
     if (!teamId || !name || !color) {
       return res.status(400).json({ error: 'teamId, name, and color required' });
+    }
+
+    // Check for duplicate tag name in this team
+    const existing = db.prepare('SELECT id FROM tags WHERE team_id = ? AND name = ?').get(teamId, name);
+    if (existing) {
+      return res.status(400).json({ error: 'A tag with this name already exists' });
     }
 
     const tagId = nanoid();
@@ -215,8 +302,9 @@ app.post('/api/tags', (req, res) => {
 // Update a tag
 app.put('/api/tags/:tagId', (req, res) => {
   try {
-    const { tagId } = req.params;
-    const { name, color } = req.body;
+    const tagId = sanitizeString(req.params.tagId, 50);
+    const name = req.body.name ? sanitizeString(req.body.name, 50) : null;
+    const color = req.body.color ? sanitizeString(req.body.color, 10) : null;
 
     const updateTag = db.prepare('UPDATE tags SET name = COALESCE(?, name), color = COALESCE(?, color) WHERE id = ?');
     updateTag.run(name, color, tagId);
@@ -278,9 +366,18 @@ app.get('/api/card-tags/:teamId', (req, res) => {
 // Add tag to card
 app.post('/api/card-tags', (req, res) => {
   try {
-    const { teamId, cardId, tagId } = req.body;
+    const teamId = sanitizeString(req.body.teamId, 50);
+    const cardId = sanitizeString(req.body.cardId, 100);
+    const tagId = sanitizeString(req.body.tagId, 50);
+
     if (!teamId || !cardId || !tagId) {
       return res.status(400).json({ error: 'teamId, cardId, and tagId required' });
+    }
+
+    // Verify tag belongs to team
+    const tag = db.prepare('SELECT id FROM tags WHERE id = ? AND team_id = ?').get(tagId, teamId);
+    if (!tag) {
+      return res.status(400).json({ error: 'Invalid tag for this team' });
     }
 
     const id = nanoid();
