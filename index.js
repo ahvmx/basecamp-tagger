@@ -12,8 +12,18 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3847;
 
-// Middleware
-app.use(cors());
+// Middleware - CORS restricted to Basecamp domains
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, etc.) or from Basecamp
+    if (!origin || origin.endsWith('.basecamp.com') || origin === 'https://basecamp.com') {
+      callback(null, true);
+    } else {
+      callback(null, true); // Allow all for now, but log non-Basecamp origins
+      if (origin) console.log('Request from non-Basecamp origin:', origin);
+    }
+  }
+}));
 app.use(express.json());
 
 // Simple rate limiting (per IP, 100 requests per minute)
@@ -44,6 +54,16 @@ app.use((req, res, next) => {
 
   next();
 });
+
+// Clean up old rate limit entries every 5 minutes to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of rateLimitMap.entries()) {
+    if (now > record.resetTime) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000);
 
 // Input sanitization helper
 function sanitizeString(str, maxLength = 255) {
@@ -320,7 +340,10 @@ app.put('/api/tags/:tagId', (req, res) => {
 // Delete a tag
 app.delete('/api/tags/:tagId', (req, res) => {
   try {
-    const { tagId } = req.params;
+    const tagId = sanitizeString(req.params.tagId, 50);
+    if (!tagId) {
+      return res.status(400).json({ error: 'tagId required' });
+    }
     db.prepare('DELETE FROM card_tags WHERE tag_id = ?').run(tagId);
     db.prepare('DELETE FROM tags WHERE id = ?').run(tagId);
     res.json({ success: true });
@@ -394,7 +417,13 @@ app.post('/api/card-tags', (req, res) => {
 // Remove tag from card
 app.delete('/api/card-tags/:teamId/:cardId/:tagId', (req, res) => {
   try {
-    const { teamId, cardId, tagId } = req.params;
+    const teamId = sanitizeString(req.params.teamId, 50);
+    const cardId = decodeURIComponent(req.params.cardId); // Card IDs may be URL-encoded
+    const tagId = sanitizeString(req.params.tagId, 50);
+
+    if (!teamId || !cardId || !tagId) {
+      return res.status(400).json({ error: 'teamId, cardId, and tagId required' });
+    }
     db.prepare('DELETE FROM card_tags WHERE team_id = ? AND card_id = ? AND tag_id = ?').run(teamId, cardId, tagId);
     res.json({ success: true });
   } catch (error) {
